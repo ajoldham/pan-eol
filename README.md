@@ -1,6 +1,6 @@
 # pan-eol
 
-Monitors the Palo Alto Networks End-of-Life pages and reports what changed since the last run, as **JSON** or **CSV**:
+Monitors the Palo Alto Networks End-of-Life pages and reports what changed since the last run, as **JSON** or **CSV** files plus readable tables in the terminal:
 
 - Software: <https://www.paloaltonetworks.com/services/support/end-of-life-announcements/end-of-life-summary>
 - Hardware: <https://www.paloaltonetworks.com/services/support/end-of-life-announcements/hardware-end-of-life-dates>
@@ -11,7 +11,8 @@ It is built to run on a schedule, using the included [`run-daily.sh`](run-daily.
 2. Parses every table row into a record. Dates are normalized to ISO `YYYY-MM-DD`.
 3. Compares the records with the saved baseline (`state/latest.json`).
 4. Writes a **snapshot** (the full dataset) and a **change report** (added, removed and modified records, down to the field).
-5. Saves the new baseline.
+5. If anything changed, prints those changes as readable tables (see [Readable change reports](#readable-change-reports)).
+6. Saves the new baseline.
 
 ## Install
 
@@ -29,6 +30,8 @@ python3 pan-eol.py --format both                      # JSON + CSV into ./output
 python3 pan-eol.py --format csv --output-dir /data/eol --state-dir /var/lib/pan-eol
 python3 pan-eol.py --stdout --format json --no-save-state   # dry run, print change report
 python3 pan-eol.py --pages hardware                   # only check one page
+python3 pan-eol.py --changes                          # readable report of the last 30 days of changes
+python3 pan-eol.py --changes 7                        # ... or of the last 7 days
 python3 pan-eol.py --from-file software=page.html     # parse a saved page (offline/testing)
 ./pan-eol.py --help                                   # it is executable, with a python3 shebang
 ```
@@ -44,6 +47,7 @@ python3 pan-eol.py --from-file software=page.html     # parse a saved page (offl
 | `--only-on-change` | off | Skip writing files when nothing changed |
 | `--from-file NAME=PATH` | — | Parse local HTML instead of fetching (can be repeated) |
 | `--retain-days N` | off | Delete timestamped snapshots and change reports older than N days. Off by default, so nothing is ever deleted unless you ask |
+| `--changes [DAYS]` | off (30 when given without a number) | Print a readable report of the change reports saved in the last DAYS days, then exit. Fetches nothing and leaves the baseline alone. Reads from `--output-dir` |
 | `--timeout SEC` | 30 | HTTP timeout |
 | `-v` / `-q` | — | Verbose or quiet logging (logs go to stderr) |
 
@@ -51,7 +55,7 @@ python3 pan-eol.py --from-file software=page.html     # parse a saved page (offl
 
 | Code | Meaning |
 |---|---|
-| `0` | Success, no changes (or first run created the baseline) |
+| `0` | Success, no changes (or first run created the baseline). `--changes` always exits 0 |
 | `3` | Success, **changes detected** |
 | `1` | Fetch or parse error. The baseline is **not** modified |
 | `2` | Invalid command-line arguments |
@@ -105,6 +109,56 @@ The record key is `category|product|version`.
 ### Change report CSV
 `detected_at, change_type, category, product, version, field, old_value, new_value`
 
+### Readable change reports
+
+Changes are shown as text tables in two places.
+
+**After a run that finds changes (exit 3)**, `pan-eol.py` prints that run's changes to stdout after writing its files. Nothing is printed when there are no changes, on the first run (when the baseline is created), on an error, or with `--stdout` (which prints the raw JSON/CSV instead). `-q` hides log messages but not this report.
+
+**`--changes [DAYS]`** reads the saved change reports in `output/changes/` and prints everything from the last DAYS days (default 30). When a run saved both JSON and CSV, the JSON file is used. Unreadable files are skipped with a warning.
+
+Both reports have the same sections:
+
+| Section | Contents |
+|---|---|
+| Header | When the report was made. A run report also shows the previous run it was compared with and the pages checked. `--changes` shows the window and how many reports it found |
+| Summary | One row per category (Software, Hardware): added, removed, relabelled, records modified, fields modified |
+| Timeline | `--changes` only: one row per run that found changes |
+| Software Changes / Hardware Changes | **Added** and **Removed** rows. **Relabelled rows**: a row removed and re-added in the same run with the same version number but a new label, e.g. `5.2.0 including hotfixes` → `5.2.0 (incl.hotfixes)`. **Modified**: field, old value and new value. Long values wrap inside the cell |
+
+Example (shortened):
+
+```
+Palo Alto Networks EOL Changes Detected
+=======================================
+
+Detected:      2026-10-01 15:25Z
+Compared with: 2026-09-30 15:25Z (previous run)
+Pages checked: software, hardware
+
+Summary
+-------
++----------+-------+---------+------------+------------------+-----------------+
+| Category | Added | Removed | Relabelled | Records modified | Fields modified |
++==========+=======+=========+============+==================+=================+
+| Software | 1     | 0       | 4          | 0                | 0               |
+| Hardware | 1     | 0       | 0          | 1                | 2               |
++----------+-------+---------+------------+------------------+-----------------+
+
+Hardware Changes
+----------------
+
+Modified (2 field(s) in 1 record(s))
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++-------------------+------------+--------+------------------------------------------+------------------------+
+| Detected          | Product    | Field  | Old value                                | New value              |
++===================+============+========+==========================================+========================+
+| 2026-10-01 15:25Z | PAN-PA-410 | Models | PAN-PA-410; PAN-PA-415; PAN-PA-440; PAN- | PAN-PA-410; PAN-PA-415 |
+|                   |            |        | PA-445; PAN-PA-450; PAN-PA-455; PAN-     |                        |
+|                   |            |        | PA-460                                   |                        |
++-------------------+------------+--------+------------------------------------------+------------------------+
+```
+
 ### Retention
 
 Timestamped files build up forever by default. Add `--retain-days N` to delete those older than N days at the end of each run:
@@ -135,6 +189,7 @@ INTERVAL_SECONDS=3600 ./run-daily.sh             # change the wait (default 8640
 
 - **Python:** it uses the project's `.venv/bin/python` if there is one, otherwise `python3`. It always runs from the project folder, so `output/` and `state/` land in the same place wherever you start it.
 - **Result line:** after each run it prints one line for the exit code: no changes (0), **CHANGES DETECTED** (3), or an error. After an error it waits and tries again next cycle.
+- **Change tables:** when a run finds changes, its [readable report](#readable-change-reports) appears between the `Running …` and `Finished: CHANGES DETECTED (exit 3)` lines, including when output goes to a log file. Days with no changes add only the two status lines. To review a longer period later, run `python3 pan-eol.py --changes`.
 - **Timing:** it counts down to a fixed time, so the countdown stays correct if the Mac sleeps. If the Mac sleeps past the scheduled time, it runs as soon as it wakes. The 24 hours start when a run finishes, so the start time moves later by a few seconds each day.
 - **Log files:** if you send the output to a file (`./run-daily.sh >> pan-eol.log 2>&1`), it writes one "Next run at …" line instead of the countdown.
 - **Stopping:** Ctrl-C clears the countdown line, prints `Stopped.` and exits with code 130. If you started it in the background (`&` or `nohup`), stop it with `kill <pid>` instead.

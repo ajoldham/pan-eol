@@ -8,6 +8,8 @@ CSV or both.
 Usage:
     python3 pan-eol.py --format both
     python3 pan-eol.py --stdout --no-save-state      # dry run
+    python3 pan-eol.py --changes                     # readable report, last 30 days
+    python3 pan-eol.py --changes 7                   # readable report, last 7 days
     python3 pan-eol.py --help
 
 Exit codes: 0 = no changes (or baseline created), 3 = changes detected,
@@ -28,6 +30,7 @@ import os
 import re
 import sys
 import tempfile
+import textwrap
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -888,6 +891,338 @@ def write_outputs(
 
 
 # =============================================================================
+# Change history report (--changes): readable tables built from saved reports
+# =============================================================================
+
+DEFAULT_CHANGES_DAYS = 30
+_CHANGE_TYPES = ("added", "removed", "modified")
+_VERSION_TOKEN = re.compile(r"\d+(?:\.\d+)+|\d+")
+_CATEGORY_TITLES = {"software": "Software", "hardware": "Hardware"}
+
+
+@dataclass
+class ChangeRun:
+    """The change report from one run, read back from output/changes/."""
+
+    stamp: datetime
+    changes: list[Change]
+
+
+def _change_from_dict(d: dict[str, Any]) -> Change:
+    """Build a Change from a JSON object or CSV row (CSV uses '' for missing values)."""
+
+    def opt(k: str) -> str | None:
+        v = d.get(k)
+        return None if v is None or v == "" else str(v)
+
+    change_type = d.get("change_type")
+    if change_type not in _CHANGE_TYPES:
+        raise ValueError(f"unknown change_type {change_type!r}")
+    category = str(d.get("category") or "")
+    product = str(d.get("product") or "")
+    version = opt("version")
+    return Change(
+        change_type=change_type,
+        key=opt("key") or f"{category}|{product}|{version or ''}",
+        category=category,
+        product=product,
+        version=version,
+        field=opt("field"),
+        old_value=opt("old_value"),
+        new_value=opt("new_value"),
+    )
+
+
+def load_change_runs(output_dir: str | Path, since: datetime | None = None) -> list[ChangeRun]:
+    """Read timestamped change reports, oldest first.
+
+    When a run wrote both JSON and CSV, the JSON file is used. Reports whose
+    timestamp is before ``since`` are skipped, and unreadable files are skipped
+    with a warning.
+    """
+    d = Path(output_dir) / "changes"
+    if not d.is_dir():
+        return []
+    files: dict[str, Path] = {}
+    for p in sorted(d.iterdir()):
+        m = _DATED_FILE.match(p.name)
+        if not m or m[2] != "changes" or not p.is_file():
+            continue
+        if m[1] in files and files[m[1]].suffix == ".json":
+            continue
+        files[m[1]] = p
+
+    runs: list[ChangeRun] = []
+    for stamp_text, p in sorted(files.items()):
+        stamp = datetime.strptime(stamp_text, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+        if since is not None and stamp < since:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+            if p.suffix == ".json":
+                rows = json.loads(text).get("changes") or []
+            else:
+                rows = list(csv.DictReader(io.StringIO(text)))
+            changes = [_change_from_dict(r) for r in rows]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            log.warning("skipping unreadable change report %s: %s", p, exc)
+            continue
+        runs.append(ChangeRun(stamp, changes))
+    return runs
+
+
+def _version_token(version: str | None) -> str | None:
+    m = _VERSION_TOKEN.search(version or "")
+    return m[0] if m else None
+
+
+def pair_renames(changes: list[Change]) -> tuple[list[tuple[Change, Change]], list[Change]]:
+    """Pair a removed row with an added row from the same run that is probably
+    the same row with a new label.
+
+    Two rows pair when they share a category and product and their row labels
+    start with the same version number, e.g. "5.2.0 including hotfixes" ->
+    "5.2.0 (incl.hotfixes)". Returns ``(pairs, remaining_changes)``.
+    """
+    removed = [c for c in changes if c.change_type == "removed"]
+    added = [c for c in changes if c.change_type == "added"]
+    pairs: list[tuple[Change, Change]] = []
+    used: set[int] = set()
+    for r in removed:
+        token = _version_token(r.version)
+        if token is None:
+            continue
+        for i, a in enumerate(added):
+            if i in used or (a.category, a.product) != (r.category, r.product):
+                continue
+            if _version_token(a.version) == token:
+                pairs.append((r, a))
+                used.add(i)
+                break
+    paired = {id(c) for pair in pairs for c in pair}
+    return pairs, [c for c in changes if id(c) not in paired]
+
+
+def render_table(headers: Sequence[str], rows: Sequence[Sequence[Any]], max_width: int = 48) -> str:
+    """Render an ASCII table. Long cells wrap at ``max_width`` characters."""
+    grid = [
+        [textwrap.wrap(str(cell), max_width) or [""] for cell in row]
+        for row in [list(headers), *rows]
+    ]
+    widths = [max(len(line) for row in grid for line in row[i]) for i in range(len(headers))]
+    rule = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    def lines_of(row: list[list[str]]) -> list[str]:
+        height = max(len(cell) for cell in row)
+        return [
+            "| "
+            + " | ".join(
+                (cell[k] if k < len(cell) else "").ljust(w)
+                for cell, w in zip(row, widths, strict=True)
+            )
+            + " |"
+            for k in range(height)
+        ]
+
+    body = grid[1:]
+    multiline = any(len(cell) > 1 for row in body for cell in row)
+    out = [rule, *lines_of(grid[0]), rule.replace("-", "=")]
+    for i, row in enumerate(body):
+        if multiline and i:
+            out.append(rule)
+        out += lines_of(row)
+    out.append(rule)
+    return "\n".join(out)
+
+
+def _heading(text: str, underline: str) -> str:
+    return f"{text}\n{underline * len(text)}"
+
+
+def _when(stamp: datetime) -> str:
+    return stamp.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _val(v: str | None) -> str:
+    return "(empty)" if v is None else v
+
+
+def _field_title(name: str | None) -> str:
+    return (name or "").replace("_", " ").capitalize()
+
+
+def format_changes_report(runs: list[ChangeRun], days: int | None, now: datetime) -> str:
+    """Build a readable, sectioned report of every change in ``runs``."""
+    out: list[str] = [_heading("Palo Alto Networks EOL Change Report", "=")]
+    window = f"last {days} day(s)" if days else "all saved reports"
+    out.append(f"Generated:  {_when(now)}\nWindow:     {window}")
+
+    if not runs:
+        out.append("No change reports found in this window.")
+        return "\n\n".join(out) + "\n"
+    with_changes = [r for r in runs if r.changes]
+    out[-1] += (
+        f"\nReports:    {len(runs)} ({_when(runs[0].stamp)} to {_when(runs[-1].stamp)}), "
+        f"{len(with_changes)} with changes"
+    )
+    if not with_changes:
+        out.append("No changes detected in this window.")
+        return "\n\n".join(out) + "\n"
+
+    out += _change_sections(with_changes, timeline=True)
+    return "\n\n".join(out) + "\n"
+
+
+def _parse_iso(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_run_changes(
+    changes: list[Change], detected: datetime, previous_run: str | None, pages: Sequence[str]
+) -> str:
+    """Build a readable report of the changes found by a single run."""
+    prev = _parse_iso(previous_run)
+    out: list[str] = [
+        _heading("Palo Alto Networks EOL Changes Detected", "="),
+        f"Detected:      {_when(detected)}\n"
+        f"Compared with: {_when(prev) if prev else previous_run or 'unknown'} (previous run)\n"
+        f"Pages checked: {', '.join(pages)}",
+    ]
+    if not changes:
+        out.append("No changes detected.")
+    else:
+        out += _change_sections([ChangeRun(detected, changes)], timeline=False)
+    return "\n\n".join(out) + "\n"
+
+
+def _change_sections(runs: list[ChangeRun], timeline: bool) -> list[str]:
+    """Summary, optional timeline, and per-category detail sections for ``runs``."""
+    out: list[str] = []
+
+    # Group by category -> section, keeping when each change was detected.
+    groups: dict[str, dict[str, list[Any]]] = {}
+    for run in runs:
+        when = _when(run.stamp)
+        pairs, rest = pair_renames(run.changes)
+        for old, new in pairs:
+            groups.setdefault(old.category, {}).setdefault("renamed", []).append((when, old, new))
+        for c in rest:
+            groups.setdefault(c.category, {}).setdefault(c.change_type, []).append((when, c))
+    categories = [c for c in PAGES if c in groups] + sorted(set(groups) - set(PAGES))
+
+    # Summary by category
+    summary_rows = []
+    for cat in categories:
+        g = groups[cat]
+        modified = g.get("modified", [])
+        summary_rows.append(
+            [
+                _CATEGORY_TITLES.get(cat, cat.title()),
+                len(g.get("added", [])),
+                len(g.get("removed", [])),
+                len(g.get("renamed", [])),
+                len({(w, c.key) for w, c in modified}),
+                len(modified),
+            ]
+        )
+    out.append(
+        _heading("Summary", "-")
+        + "\n"
+        + render_table(
+            ["Category", "Added", "Removed", "Relabelled", "Records modified", "Fields modified"],
+            summary_rows,
+        )
+    )
+
+    # Timeline: one row per run that found changes
+    if timeline:
+        timeline_rows = []
+        for run in runs:
+            s = summarize(run.changes)
+            timeline_rows.append(
+                [_when(run.stamp), s["added"], s["removed"], s["records_modified"], s["modified"]]
+            )
+        out.append(
+            _heading("Timeline", "-")
+            + "\n"
+            + render_table(
+                ["Detected", "Added", "Removed", "Records modified", "Fields modified"],
+                timeline_rows,
+            )
+        )
+
+    # Detail sections per category
+    for cat in categories:
+        g = groups[cat]
+        title = _CATEGORY_TITLES.get(cat, cat.title())
+        section = [_heading(f"{title} Changes", "-")]
+        show_version = any(c.version for items in g.values() for item in items for c in item[1:])
+
+        def by_row(item: tuple[Any, ...]) -> tuple[str, str, str]:
+            c = item[1]
+            return (c.product, c.version or "", item[0])
+
+        for kind, label in (("added", "Added"), ("removed", "Removed")):
+            items = sorted(g.get(kind, []), key=by_row)
+            if not items:
+                continue
+            headers = ["Detected", "Product"] + (["Version / row"] if show_version else [])
+            rows = [[w, c.product] + ([c.version or "-"] if show_version else []) for w, c in items]
+            section.append(
+                _heading(f"{label} ({len(items)})", "~") + "\n" + render_table(headers, rows)
+            )
+
+        renamed = sorted(g.get("renamed", []), key=by_row)
+        if renamed:
+            section.append(
+                _heading(f"Relabelled rows ({len(renamed)})", "~")
+                + "\nA row was removed and a row with the same version number was added "
+                "in the same run. This is usually the same row with a new label.\n"
+                + render_table(
+                    ["Detected", "Product", "Old label", "New label"],
+                    [[w, o.product, o.version or "-", n.version or "-"] for w, o, n in renamed],
+                )
+            )
+
+        modified = sorted(g.get("modified", []), key=lambda it: (*by_row(it), it[1].field or ""))
+        if modified:
+            headers = (
+                ["Detected", "Product"]
+                + (["Version / row"] if show_version else [])
+                + ["Field", "Old value", "New value"]
+            )
+            rows = [
+                [w, c.product]
+                + ([c.version or "-"] if show_version else [])
+                + [_field_title(c.field), _val(c.old_value), _val(c.new_value)]
+                for w, c in modified
+            ]
+            n_records = len({(w, c.key) for w, c in modified})
+            section.append(
+                _heading(f"Modified ({len(modified)} field(s) in {n_records} record(s))", "~")
+                + "\n"
+                + render_table(headers, rows, max_width=40)
+            )
+        out.append("\n\n".join(section))
+
+    return out
+
+
+def report_changes(args: argparse.Namespace) -> int:
+    """Handle --changes: print a report of saved change reports. Nothing is fetched."""
+    now = _utcnow()
+    since = now - timedelta(days=args.changes)
+    runs = load_change_runs(args.output_dir, since)
+    sys.stdout.write(format_changes_report(runs, args.changes, now))
+    return EXIT_OK
+
+
+# =============================================================================
 # Command line: fetch -> parse -> diff -> write -> save baseline
 # =============================================================================
 
@@ -961,6 +1296,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="delete timestamped snapshots/change reports older than N days "
         "(default: keep everything)",
+    )
+    p.add_argument(
+        "--changes",
+        nargs="?",
+        type=_positive_int,
+        const=DEFAULT_CHANGES_DAYS,
+        default=None,
+        metavar="DAYS",
+        help="print a readable report of the change reports saved in the last DAYS days "
+        f"(default {DEFAULT_CHANGES_DAYS}) under --output-dir, then exit; "
+        "fetches nothing and leaves the baseline unchanged",
     )
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     v = p.add_mutually_exclusive_group()
@@ -1103,6 +1449,13 @@ def run(args: argparse.Namespace) -> int:
         ):
             log.info("wrote %s", p)
 
+    # Print this run's changes as readable tables. Skipped with --stdout (which
+    # already prints the raw report) and when nothing changed or no baseline existed.
+    if changes and not args.stdout:
+        sys.stdout.write(format_run_changes(changes, now, changes_meta["previous_run"], selected))
+        # Flush now so the report lands before later log lines when output is redirected.
+        sys.stdout.flush()
+
     if args.retain_days is not None:
         pruned = prune_outputs(args.output_dir, args.retain_days, now)
         log.info(
@@ -1136,6 +1489,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
         force=True,
     )
+    if args.changes is not None:
+        return report_changes(args)
     return run(args)
 
 
